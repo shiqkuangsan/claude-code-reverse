@@ -306,6 +306,46 @@ Stop Hook 运行在 REPL 上下文中（关键差异）：
 - 并行执行，收集阻塞错误
 - exit code 2 → 反馈给模型
 
+## 内部钩子双管线：postSampling vs handleStopHooks
+
+除了对外暴露给 `settings.json` 的 26 个事件，Claude Code **内部**还有另一套「函数式 Hook」管线，用于挂载系统级生命周期回调。后台双记忆系统（sessionMemory 与 extractMemories）走的就是这两条**完全独立的管线**。
+
+理解这一点对于 Hook 系统至关重要：它们经常被误以为是「同一套 Hook」，但实际触发时机、调度路径、注册接口都不同。
+
+### 管线对比
+
+| 维度          | `registerPostSamplingHook`                          | `handleStopHooks` (`stopHooks.ts`)                |
+| ------------- | --------------------------------------------------- | ------------------------------------------------ |
+| **触发时机**   | 模型每次采样（sampling）后                            | 主对话稳定终止（无 tool_use 返回）时               |
+| **调用频率**   | 高频——每个 assistant message 都触发                   | 低频——只在完整 stop_reason: end_turn 时触发        |
+| **注册方式**   | `registerPostSamplingHook(callback)`                | `handleStopHooks` 在 query loop 末尾被调用         |
+| **是否阻塞**   | 非阻塞，切面式异步执行                                 | 可阻塞（`preventContinuation: true`）              |
+| **典型消费者** | `sessionMemory`（后台总结当前回合）                    | `extractMemories`（提炼跨会话长期记忆）             |
+| **设计意图**   | 在每次模型「思考完一段落」后做轻量收尾工作               | 在完整 round-trip 结束后做重量级善后               |
+
+### 为什么要两条管线？
+
+Anthropic 团队没有用单一 Hook 接口承载所有后台工作，而是显式分离这两个时机，原因在于：
+
+1. **频率隔离**：sessionMemory 每轮都要更新（高频），extractMemories 只在对话真正告一段落时萃取（低频）。混在一起会产生大量误触
+2. **状态机纯净**：核心 `query.ts` 的 `while(true)` 循环不需要知道这些后台工作存在。两个 Hook 管线让 query 保持「只关心模型对话」的纯净状态
+3. **失败隔离**：sessionMemory 失败不会影响 extractMemories，反之亦然
+4. **资源调度**：postSampling 是同步切入点，stopHooks 是「停手后才慢慢处理」的延后调度
+
+### 切面式设计的优雅之处
+
+```typescript
+// 在 services/SessionMemory/sessionMemory.ts 中
+registerPostSamplingHook(extractSessionMemory)
+
+// 在 services/extractMemories/extractMemories.ts 中
+// 由 stopHooks.ts 的 handleStopHooks 在 query loop 末尾自动调度
+```
+
+两个后台系统**各自挂载到自己的钩子**，与 `query.ts` 之间没有任何直接耦合。要新增第三条后台流水线？再注册一个 hook 即可，`query.ts` 一行不动。这是非常教科书级的**关注点分离**与**切面编程**。
+
+详见 [`dd-05-memory.md`](dd-05-memory.md) sessionMemory vs extractMemories 权限对比章节。
+
 ## 会话 Hook（运行时）
 
 **文件**: `utils/hooks/sessionHooks.ts`

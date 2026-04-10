@@ -16,14 +16,14 @@ restored/         # Source restored from source map
   vendor/         # Native addon source
   node_modules/   # Bundled dependencies
 
-docs/             # Architecture & mechanism analysis (33 documents)
+docs/             # Architecture & mechanism analysis (34 documents)
   00-11           # Architecture overview series (12 docs)
-  deep-dive/      # Deep-dive mechanism analysis (21 docs)
+  deep-dive/      # Deep-dive mechanism analysis (22 docs)
 ```
 
 ## Documentation
 
-33 documents covering the complete internals of Claude Code, organized in two series:
+34 documents covering the complete internals of Claude Code, organized in two series:
 
 ### Architecture Overview (12 docs)
 
@@ -42,7 +42,7 @@ docs/             # Architecture & mechanism analysis (33 documents)
 | 10 | [Services & Infrastructure](docs/10-services-infrastructure.md) | API, auth, analytics, settings, LSP |
 | 11 | [Permission & Security](docs/11-permission-security.md) | Permission modes, classifier, sandbox |
 
-### Deep Dive Series (21 docs)
+### Deep Dive Series (22 docs)
 
 | # | Document | Topic |
 |---|----------|-------|
@@ -67,6 +67,7 @@ docs/             # Architecture & mechanism analysis (33 documents)
 | dd-19 | [Voice Mode](docs/deep-dive/dd-19-voice.md) | Audio capture, STT, hold-to-talk |
 | dd-20 | [Prompt Suggestions](docs/deep-dive/dd-20-suggestions.md) | Suggestion generation, speculation, tips |
 | dd-21 | [Output Styles](docs/deep-dive/dd-21-output-styles.md) | Style system, plugin integration |
+| dd-22 | [Harness Engine Overview](docs/deep-dive/dd-22-harness-engine-overview.md) | Harness 全景：洋葱模型、七阶段生命周期、三大设计哲学 |
 
 ## Tech Stack
 

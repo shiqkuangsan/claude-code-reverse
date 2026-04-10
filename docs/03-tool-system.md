@@ -10,6 +10,21 @@ Claude Code 的工具系统是整个产品的核心能力层。通过统一的 `
 
 **文件**: `Tool.ts` (~793行)
 
+> `Tool.ts` 是整个 Claude Code 会话中「手脑结合」的关键，是系统中所有大模型外部能力（Bash、文件、MCP、Agent 派生等）的元对象基类和类型系统中心。它没有直接实现复杂的外部交互，而是搭起了一套严密的**工具插槽和沙盒管线规范**。
+
+### 四大职责链
+
+`Tool.ts` 为所有插件/工具确立了规则，每个工具的接口由四条职能链构成：
+
+| 职责链           | 关注点                                  | 关键字段/方法                                                                       |
+| --------------- | --------------------------------------- | --------------------------------------------------------------------------------- |
+| **① 描述侧**     | LLM 如何理解这个工具                      | `inputSchema` (Zod)、`description(input, options)`、`searchHint`                    |
+| **② 环境与安全** | 运行时环境、权限分级                       | `ToolUseContext`、`isDestructive()`、`isReadOnly()`、`isConcurrencySafe()`          |
+| **③ 运行时拦截** | 软阻拦与硬鉴权                             | `validateInput()`、`checkPermissions()` + `ToolPermissionContext`                   |
+| **④ UI 渲染**    | 工具状态如何在 Ink 终端 UI 上「画」出来      | `renderToolUseMessage` 等 5 个 React.ReactNode 函数                                  |
+
+这套**工具/UI 高度耦合，但与大模型逻辑互相分离**的中间层合约是 Claude Code 的关键设计：开发者要新增一个工具，只需实现这套对象图（Zod 约束 + 渲染 React 组件块），就能安全享有大模型流式生成、鉴权、并发、中断的无缝系统待遇。
+
 ### 核心字段
 
 ```typescript
@@ -31,10 +46,12 @@ type Tool<Input, Output, P extends ToolProgressData> = {
   description(input, options): Promise<string>
   prompt(options): Promise<string>
 
-  // === 渲染 ===
-  renderToolUseMessage(input, options): React.ReactNode
-  renderToolResultMessage?(content, options): React.ReactNode
-  renderToolUseProgressMessage?(progressMessages, options): React.ReactNode
+  // === 渲染（UI 生命周期下沉到每个 Tool 内部） ===
+  renderToolUseMessage(input, options): React.ReactNode          // 工具开始调用时如何显示标题（如 "Running: git status"）
+  renderToolUseProgressMessage?(progressMessages, options): React.ReactNode  // 耗时任务运行过程中如何显示进度
+  renderToolResultMessage?(content, options): React.ReactNode    // 成功拿到结果后如何展示给用户
+  renderToolUseRejectedMessage?(input, options): React.ReactNode // 被安全拦截器驳回时如何报错
+  renderGroupedToolUse?(uses, options): React.ReactNode          // 多工具极速并发时如何做组动画合并避免刷屏
 
   // === 分类 ===
   isReadOnly(input): boolean
@@ -59,7 +76,7 @@ type ToolResult<T> = {
 }
 ```
 
-### buildTool 工厂
+### buildTool 工厂：Fail-Closed 默认值
 
 构建者模式，填充常见默认值，简化工具定义：
 
@@ -81,6 +98,25 @@ const TOOL_DEFAULTS = {
   checkPermissions: () => ({ behavior: 'allow', updatedInput }),
 }
 ```
+
+**底层防穿透默认值填充（Fail-Closed Defaults）的核心意图**：只要工具开发者**不显式指明**某个工具是干嘛的，它就被视为「可能不能并发，可能没有破坏性」。这种保守假设确保新工具加入系统时不会因为忘了声明某个特征字段而出现并发踩踏或漏过权限拦截。
+
+工厂还保证了系统中调用方永远不需要写 `if (tool.isEnabled?.())` 这样烦人的可选链繁文缛节——所有特征函数都保证存在。
+
+### MCP 与老派插件兜底
+
+文件中针对通用插件标准 MCP（Model Context Protocol）及其专有元数据（`mcpInfo`、`inputJSONSchema`）做了特殊兜底。确保**哪怕这些工具非 TypeScript 书写、没有 Zod 声明和特定 UI 方法，依然能在运行时被同等看待和容忍**。
+
+### 数据反哺（`backfillObservableInput`）
+
+某些工具（如输入 `cd ..` 给 BashTool）会**隐式改变后续模型的工作目录和参数**——这些副作用对模型是不可见的，容易引发幻觉。`backfillObservableInput` 提供了一种「原地修改并反馈回源」的能力：
+
+```typescript
+// 工具执行后，反哺被扩展填平的绝对补全参数
+backfillObservableInput(rawInput, expandedInput)
+```
+
+让大模型在其后续发出的事件日志里**「看到」**这个被填平后的真实参数，确保大模型幻觉最小化。这是工具系统对「可观察性」的极致追求。
 
 ## ToolUseContext
 

@@ -6,6 +6,8 @@
 
 Claude Code 实现了精妙的**四层令牌管理系统**，在 `query.ts:365-468` 的查询循环中按序执行。从最轻量到最重量，逐步削减上下文大小，确保对话不超出模型的上下文窗口。
 
+> **设计哲学**：当绝大部分 AI 衍生客户端用 `messages.splice(0, length-10)` 这种粗暴野蛮、容易导致语境断裂的切片方法防爆时，Claude 团队构建的是一张**金字塔式的三级防爆与阻断折叠体系**——优先切掉旁枝末角（microCompact），再尝试复用廉价的备胎成果（sessionMemoryCompact），最后才动用昂贵的终极重构（Legacy Compact）。这才是「Agent 耐力赛引擎」应当具备的素质。
+
 ## 四层执行顺序
 
 ```
@@ -42,13 +44,16 @@ Layer 4: autoCompact          → 全上下文 API 总结压缩
 
 三个子路径：
 
-### 3a. 缓存微压缩（Cached Microcompact）
+### 3a. 缓存微压缩（Cached Microcompact / API 缓存无损编辑）
 
-使用 Claude API 的 `cache_edits` 功能，在**不失效缓存前缀**的情况下删除工具结果：
+这是极其先锋的后端缓存编辑机制。使用 Claude API 的 `cache_edits` 功能，**通知 API 服务器在不破坏此前庞大的 Prompt 前缀缓存连贯性的前提下，只从树上摘除几个旧的 Tool Result 分支**：
+
 - 当工具数量超过 `triggerThreshold` 时触发
 - 保留最近 `keepRecent`（5-10）个工具
-- 通过 API 层 cache_edits 块提交，返回 `cache_deleted_input_tokens`
+- 通过 API 层 `cache_edits` 块提交，返回 `cache_deleted_input_tokens`
 - 不修改本地消息数组
+
+**这种方法不仅省钱还能维持几百毫秒的首屏极速响应**——是 Claude Code 超越普通 Agent 客户端的关键技术之一。
 
 ### 3b. 时间基线微压缩（Time-Based）
 
@@ -68,13 +73,28 @@ Layer 4: autoCompact          → 全上下文 API 总结压缩
 
 ## Layer 4: Auto Compact
 
-**触发**: token 超过 `有效窗口 - 13,000`
+**触发**: token 超过 `有效窗口 - AUTOCOMPACT_BUFFER_TOKENS(13,000)`
 
 ### 阈值计算
 
+```typescript
+// 关键常量
+const AUTOCOMPACT_BUFFER_TOKENS = 13_000
+
+autoCompactThreshold = getEffectiveContextWindowSize(model) - AUTOCOMPACT_BUFFER_TOKENS
 ```
-autoCompactThreshold = getEffectiveContextWindowSize(model) - 13,000
-```
+
+**为什么是 13,000？** 这是 Anthropic 团队反复调优的「安全缓冲」——既要给后续工具调用和模型回答留足空间，又不能让用户提前感受到压缩延迟。当主对话的 Token 量距离阈值仅剩不到 13K 时，系统就会动作。
+
+### 二级防线优先：Session Memory 偷换术
+
+传统对话客户端在这时候会卡转圈——它必须去另外开一个沉重的模型调用，把前文完整吃下去生成汇总。但 Claude Code 有「影子工会」一直在后台偷偷写 `SESSION_MEMORY.md` 短篇总结（甚至帮我们做好了章节梳理），所以本模块选择**「摘果子」**：
+
+1. 直接读取硬盘里那份不到 2000 个 Token 的旧总结文件
+2. 调用 `calculateMessagesToKeepIndex` 函数拉网，计算出哪些对话是后台还没来得及写的「新鲜肉」。**为了保证不产生幻觉崩溃，它会仔细对齐结构，绝不会把模型的「思考锁 → 发工具 → 获结果」三连招拦腰劈断**
+3. 把前半截废老对话直接暴力删除，在界面原位凭空注射一份带有摘要文件的「系统级紧凑幽灵节点」，随后拼接后半截的聊天
+
+**0 额外发请求，0 等待延迟**！这是 sessionMemoryCompact 与 Legacy Compact 的本质差异。
 
 ### 警告阈值体系
 

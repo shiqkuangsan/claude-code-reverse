@@ -103,53 +103,151 @@ feedback/project 推荐结构:
 
 ## Session Memory 服务
 
-**文件**: `services/SessionMemory/`
+**文件**: `services/SessionMemory/sessionMemory.ts`（~500 行）
 
 后台自动维护当前对话的注释，使用 forked subagent 不中断主对话。
 
-### 触发条件
+### 三重门控触发器（`shouldExtractMemory()`）
 
-```
-初始化：消息 token 超过 minimumMessageTokensToInit
-更新条件（满足任一）：
-  - token 增长 ≥ minimumTokensBetweenUpdate AND 工具调用 ≥ toolCallsBetweenUpdates
-  - token 增长 ≥ threshold AND 最后一轮无工具调用
-```
+`shouldExtractMemory()` 是判断是否触发提炼的核心逻辑门，必须**同时满足**三个条件，以防消耗 Token 或打断节奏：
+
+| 门控                          | 含义                                                                |
+| ----------------------------- | ----------------------------------------------------------------- |
+| **容量门** `hasMetUpdateThreshold` | 距上次总结后新增 Token 数必须达到配置阈值                            |
+| **行为门** `hasMetToolCallThreshold` | 距上次记录系统须调用了足够多的新工具（发生足够多的实质性动作）          |
+| **时机门** `!hasToolCallsInLastTurn` | **绝不会在模型等待工具回调时截断**——必须等到模型「思考完一段落」 |
 
 ### 配置源
 
 GrowthBook 动态配置 (`tengu_sm_config`) > DEFAULT_SESSION_MEMORY_CONFIG
 
+### Forked Agent 隔离执行
+
+```typescript
+// 1. 创建全新隔离上下文，防污染当前对话状态
+const subagentContext = createSubagentContext(toolUseContext)
+
+// 2. 派生子代理，享受父线索的 Prompt Cache 命中
+runForkedAgent({
+  ...subagentContext,
+  forkLabel: 'session_memory',
+  canUseTool: createMemoryFileCanUseTool(memoryPath),  // 极度严格权限
+})
+```
+
 ### 文件位置
 
-`~/.claude/projects/<slug>/session_memory.md` — 仅允许 Edit 该文件。
+`~/.claude/projects/<slug>/session_memory.md` — **仅允许 Edit 该单一文件**。
+
+### 手动唤起逃生口
+
+`manuallyExtractSessionMemory` 暴露给斜杠命令层（CLI 侧 `/summary`）。当处于紧急状态或任务交接时，用户主动键入指令将**绕过所有 Token 检测闸**，强制拉取所有上下文总结入记忆块。
+
+### 切面式 Hook 解耦
+
+`sessionMemory` 并没有粗暴写死在 `query.ts` 的 `while(true)` 循环内，而是利用：
+
+```typescript
+registerPostSamplingHook(extractSessionMemory)
+```
+
+挂载在 **Post Sampling Hook** 生命周期的结束点。这是极其优雅的切面编程设计，保持核心状态机的纯净。详见 [`dd-01-hooks.md`](dd-01-hooks.md) 双管线对比章节。
 
 ## Extract Memories 服务
 
-**文件**: `services/extractMemories/`
+**文件**: `services/extractMemories/extractMemories.ts`（~600 行）
 
-在每个完整查询循环末尾运行（模型响应无工具调用时），通过 forked agent 自动提取持久内存。
+在每个完整查询循环末尾运行（模型响应无工具调用时），通过 forked agent 自动提取持久内存。**与 sessionMemory 走完全不同的 Hook 管线**——它由 `stopHooks.ts` 的 `handleStopHooks` 调度（详见 [`dd-01-hooks.md`](dd-01-hooks.md)）。
 
-### 门控
-
-```
-功能门: tengu_passport_quail (GrowthBook)
-+ 自动内存启用
-+ 非远程模式
-+ 仅主 agent
-```
-
-### 互斥逻辑
-
-`hasMemoryWritesSince()` 检查主 agent 是否写入自动内存路径。如果是，跳过 forked 提取（避免冲突）。
-
-### 工具权限
+### 门控（多层防穿透）
 
 ```
-允许: Read/Grep/Glob (无限制), Bash (仅读操作)
-      Edit/Write (仅限自动内存目录)
-拒绝: 所有其他工具
+1. 功能门: tengu_passport_quail (GrowthBook)
+2. 自动内存启用
+3. 非远程模式
+4. 仅主 agent
+5. 节流器: turnsSinceLastExtraction (受 tengu_bramble_lintel 配置控制)
+6. 互斥检查: hasMemoryWritesSince（若主 agent 已直接写过 memory 文件则跳过）
 ```
+
+只有通过**所有门控**后才会真正启动子代理。
+
+### 闭包沙盒状态机（`initExtractMemories`）
+
+作者没有把状态变量设为全局共享，而是用一个 `initExtractMemories()` 工厂闭包持有：
+
+```typescript
+function initExtractMemories() {
+  let inProgress = false       // 当前有没有上一次记忆正在生成？
+  let pendingContext = null    // 用于 trailing run 的合并状态
+
+  return async function extract(ctx) {
+    if (inProgress) {
+      pendingContext = ctx     // Stash 逻辑：合并到待处理
+      return
+    }
+    inProgress = true
+    try {
+      await runExtraction(ctx)
+    } finally {
+      inProgress = false
+      if (pendingContext) {
+        const next = pendingContext
+        pendingContext = null
+        extract(next)          // Trailing run：立刻衔接尾随提取
+      }
+    }
+  }
+}
+```
+
+**Trailing run 设计**：如果当前模型思考很快，记忆生成还在跑，用户又触发了新一轮——系统会把当前记录更新至 `pendingContext`，等前一条记忆刚写完（`finally` 块），立马衔接开启尾随提取，**永远不死锁且不漏看任何新句子**。
+
+### 双重大脑互斥锁（`hasMemoryWritesSince`）
+
+代码考虑到了极端场景：用户在主对话中可能直接说「你把这个给我记在配置里」。如果主 agent 已经主动用 `FileWriteTool` 往 memory 文件夹写过规则，互斥锁会立刻 `return`，**防止主系统和后台代理发生人格分裂和重复抢占写入**。
+
+### Prompt Cache 寄生体系
+
+子代理虽然是后台新开的 API 请求，但因为它是从**主线循环上下文中完美克隆出的参数 Fork**，它能极大地通过 Anthropic API 的 Prompt Cache 特性，无需重新计费前面的万字长文，只须付一点点新运算 Token——**在几乎零成本的基础上获得智能提取服务**。
+
+日志中能看到这段输出：`cache: read=... create=... input=... (X% hit)`，这是 Cache 寄生的命中证据。
+
+### 工具权限：`createAutoMemCanUseTool`
+
+```
+允许: Read/Grep/Glob (无限制读取整个工程)
+      Bash (仅 ls/find/cat/stat 等只读命令)
+      Edit/Write (仅限 ~/.claude/projects/.../memory/ 目录)
+拒绝: 所有其他工具（包括动业务源码的 FileEdit/FileWrite/写 Bash）
+```
+
+### 60 秒宽限期逃生窗口（`drainPendingExtraction`）
+
+```typescript
+drainPendingExtraction({ timeoutMs: 60_000 })
+```
+
+CLI 被 `Ctrl+C` 中断退出前，挂起一个带超时回收器的钩子，向系统申请 **60 秒隐形宽限期**，保证即使用户强退程序，刚刚学会的知识依然会被拼死写入硬盘。
+
+### 用户前台反馈（`createMemorySavedMessage`）
+
+当后台线程写出优质记忆片段时，会偷偷向主干道塞回一条幽灵消息：`appendSystemMessage?.(msg)`。终端 UI 在聊天间隙会冷不丁升起一个小标签：`[X memories saved]`。
+
+## sessionMemory vs extractMemories：权限对比
+
+两套后台子代理虽然都在「模型回答后」触发，但权限范围**天差地别**——这是 Claude Code 防御性设计的精髓体现：
+
+| 维度              | sessionMemory                               | extractMemories                                  |
+| ----------------- | ------------------------------------------- | ------------------------------------------------ |
+| **触发钩子**      | `registerPostSamplingHook`（采样后切面）       | `handleStopHooks` (`stopHooks.ts`)                |
+| **触发时机**      | 每次模型采样后                                | 主对话稳定终止时                                   |
+| **权限工厂**      | `createMemoryFileCanUseTool`                | `createAutoMemCanUseTool`                        |
+| **可读工具**      | （无）                                        | Read / Grep / Glob / 只读 Bash（`ls`/`find`/`cat`） |
+| **可写工具**      | **仅 FILE_EDIT_TOOL，仅一个目标文件**          | Edit / Write（仅在 memory 目录内）                  |
+| **写入目标**      | `session_memory.md` 单文件                   | `~/.claude/projects/<slug>/memory/` 整个目录       |
+| **设计意图**      | 极度严格——只能更新一份长程摘要                 | 适度宽松——允许复盘上下文写更细的记忆词条             |
+| **强退保护**      | 无                                          | `drainPendingExtraction` 60 秒宽限期                |
 
 ## Auto Dream / DreamTask
 

@@ -10,6 +10,8 @@
 
 **文件**: `context.ts` (~190行)
 
+> `context.ts` 是让 Agent 知道「现在是几点？这是谁的项目？有没有我必须背下来的本地规矩？」的**潜意识注射站**。如果说 `query.ts` 是神经循环、`QueryEngine.ts` 是底盘，那么 `context.ts` 就是把环境包裹成「世界观和自我意识」喂给大模型的关键数据源。
+
 ### 系统上下文
 
 ```typescript
@@ -19,11 +21,34 @@ export const getSystemContext = memoize(async (): Promise<{ [k: string]: string 
     currentBranch,
     mainBranch,         // 用于 PR
     gitUser,
-    'git status --short',  // 截断到 2000 字符
+    'git status --short',  // 截断到 MAX_STATUS_CHARS=2000 字符
     'git log --oneline -5'
   }
 })
 ```
+
+### Git 环境态感知（`getGitStatus`）
+
+这是一个自动嗅探当前工作区源码版本管理状态的工作流：
+
+- **并发探查**：一次并发执行**四个命令**——
+  1. 获取当前分支
+  2. 获取主分支（用于 PR）
+  3. `git status --short`
+  4. `git log --oneline -5`（最近 5 条记录）
+  5. （并发但独立）`git config user.name`
+
+- **抗爆防刷屏机制**：返回巨大的 Git 变更树会严重污染上下文。系统设定了 `MAX_STATUS_CHARS = 2000`。一旦超出，强制截断并附加固定提示：
+
+  > `...(truncated because it exceeds 2k characters. If you need more information, run 'git status' using BashTool)`
+
+  这是一种巧妙的诱导：**强迫 AI 在真的需要读全貌时，自己长出对应的「手」去调 BashTool**，而不是无脑塞入 system prompt。
+
+- **固化提示词**：开场白强制加上 `Note that this status is a snapshot in time...`（这是初始快照，聊天期间不会更新）
+
+### 缓存击穿调试机制（`cacheBreaker`）
+
+`getSystemContext` 还包含一个内部调试机制：对于 Anthropic 内部员工/调试场景（`ant-only` 且配置了 `BREAK_CACHE_COMMAND` 环境变量），系统会植入一段毫无规律的魔法字符串，使得 API 服务端的 Prompt Cache 失效，强迫大模型重新完整过一遍上下文。这是工程团队的内部排查工具，普通用户不会触发。
 
 ### 用户上下文
 
@@ -40,7 +65,23 @@ export const getUserContext = memoize(async (): Promise<{ [k: string]: string }>
 - `--bare` 模式下跳过（除非有 `--add-dir`）
 - 可通过 `CLAUDE_CODE_DISABLE_CLAUDE_MDS` 环境变量禁用
 - 注入的内存文件被 `filterInjectedMemoryFiles()` 过滤
+- **缓存隔离反环策略**：抓取后的 Memory 字符串被压进内存全局缓存（`setCachedClaudeMdContent`），避免鉴权系统形成循环依赖（`filesystem` → `permissions` → `yoloClassifier` → `claudemd`）
 - 缓存到 bootstrap state 供 yoloClassifier 使用
+
+### memoize 防刷扫描
+
+`getSystemContext` 与 `getUserContext` 都用了 `lodash.memoize` 包装。**所有的环境包裹数据都会被缓存**，确保单次会话循环中不会被反复触发扫描。这意味着：
+
+- Git 状态每次会话只采集一次（除非显式 `flushContextCache`）
+- `CLAUDE.md` 内容只读一次
+- 时间戳锚点也只生成一次
+
+### 「冷启动注射」设计哲学
+
+通过这个精简的文件，可以学到一种很高级的 Agent 工程技巧：**Cold-start Injection**（冷启动注射）。
+
+1. **不需要把所有工具都交给模型，而是把环境「喂」给模型**：系统并没有专门做一个 `GetGitStatusTool` 让 AI 第一步总是去调用，而是选择在一开始悄悄运行后垫在系统提示词下面，**极大节省开局第一个 RoundTrip 的耗时**
+2. **永远不要信任外界的信息长度**：即便只是短短一个 `git status` 也可能因为前端装了一个巨大的 vendor 依赖且忘了配 `.gitignore` 而导致十几万字。`MAX_STATUS_CHARS` 这种防御性截断 + 诱导 AI 主动去挖坑的设计，是底层 Agent 不崩溃的安全底线
 
 ## System Prompt 组装
 
